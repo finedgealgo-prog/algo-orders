@@ -103,6 +103,9 @@ class ManualOrderLeg(BaseModel):
     product: str             # "NRML" / "MIS"
     price: float = 0.0
     trigger_price: float = 0.0
+    leg_id: str = ""        # Order Pad row id (client-generated) — echoed back so the
+                             # frontend can match each result to its exact row/leg instead
+                             # of relying on array order.
 
 
 class ManualOrderRequest(BaseModel):
@@ -316,26 +319,60 @@ def _fetch_dhan_market_data(segment: str, sec_ids: list[int], db) -> dict[str, d
     return result
 
 
-async def _fetch_dhan_quote_for_leg(leg: "ManualOrderLeg", raw_db) -> dict | None:
+async def _fetch_dhan_quote_for_leg(leg: "ManualOrderLeg", raw_db, quote_cache: dict[str, dict] | None = None) -> dict | None:
     """
     Resolves this leg's Dhan security_id and returns its live quote {"symbol","ltp","bid","ask"}.
     Returns None if Dhan has no contract match for this leg at all.
 
     Shared by _resolve_mpp_price and _resolve_ltp_price — every order's price, regardless of
     which broker (FlatTrade/Kite/Dhan) actually executes it, is read from this one feed.
+
+    quote_cache (security_id -> quote dict), when given, is consulted before ever calling Dhan's
+    REST /marketfeed/quote — see _batch_prefetch_dhan_quotes: that endpoint is rate-gated to one
+    call per ~1.05s per process (wait_for_dhan_slot), so resolving each leg of a multi-leg order
+    independently here serializes them behind that gate — 96ms for the first leg, ~1.1s more for
+    the second, growing with leg count. The core function prefetches every leg's quote in one
+    batched call before placing any leg, so this only ever falls back to a live REST call when
+    the cache doesn't have it yet (e.g. instrument missing from the batch resolve).
     """
     resolved = await asyncio.to_thread(_resolve_dhan_security, leg, raw_db)
     if not resolved:
         return None
-    quote = (await asyncio.to_thread(
-        _fetch_dhan_market_data, resolved["exchange_segment"], [int(resolved["security_id"])], _shared_mongo,
-    )).get(resolved["security_id"], {})
+    sec_id = resolved["security_id"]
+    if quote_cache is not None and sec_id in quote_cache:
+        quote = quote_cache[sec_id]
+    else:
+        quote = (await asyncio.to_thread(
+            _fetch_dhan_market_data, resolved["exchange_segment"], [int(sec_id)], _shared_mongo,
+        )).get(sec_id, {})
     return {
         "symbol": resolved["symbol"],
         "ltp": float(quote.get("ltp") or 0),
         "bid": float(quote.get("bid") or 0),
         "ask": float(quote.get("ask") or 0),
     }
+
+
+async def _batch_prefetch_dhan_quotes(orders: list["ManualOrderLeg"], raw_db) -> dict[str, dict]:
+    """
+    Resolves every MPP/LTP leg's Dhan security in parallel (cheap Mongo lookups, no rate limit),
+    then fetches all their quotes in ONE call per exchange segment instead of one REST round trip
+    per leg — see _fetch_dhan_quote_for_leg's docstring for why per-leg calls stack up behind
+    Dhan's ~1.05s quote rate gate. Returns {security_id: quote_dict}, empty if no leg needs a
+    live price (plain LIMIT/MARKET/SL orders use their own typed-in price, no feed lookup at all).
+    """
+    price_legs = [o for o in orders if o.order_type in ("MPP", "LTP")]
+    if not price_legs:
+        return {}
+    resolved_list = await asyncio.gather(*(asyncio.to_thread(_resolve_dhan_security, leg, raw_db) for leg in price_legs))
+    by_segment: dict[str, list[int]] = {}
+    for resolved in resolved_list:
+        if resolved:
+            by_segment.setdefault(resolved["exchange_segment"], []).append(int(resolved["security_id"]))
+    quote_cache: dict[str, dict] = {}
+    for segment, sec_ids in by_segment.items():
+        quote_cache.update(await asyncio.to_thread(_fetch_dhan_market_data, segment, sec_ids, _shared_mongo))
+    return quote_cache
 
 
 def _notify_mpp_ltp_price_unresolved(kind: str, message: str) -> None:
@@ -352,7 +389,7 @@ def _notify_mpp_ltp_price_unresolved(kind: str, message: str) -> None:
         log.warning("[%s PRICE] notify_admin failed: %s", kind, exc)
 
 
-async def _resolve_mpp_price(leg: "ManualOrderLeg", raw_db) -> float:
+async def _resolve_mpp_price(leg: "ManualOrderLeg", raw_db, quote_cache: dict[str, dict] | None = None) -> float:
     """
     MPP's bid + protection% / ask - protection% formula, priced off Dhan's feed regardless of
     the execution broker (see _fetch_dhan_quote_for_leg).
@@ -365,7 +402,7 @@ async def _resolve_mpp_price(leg: "ManualOrderLeg", raw_db) -> float:
     """
     from features.live_order_manager import _mpp_protection_pct, _clamp_limit_price
 
-    quote = await _fetch_dhan_quote_for_leg(leg, raw_db)
+    quote = await _fetch_dhan_quote_for_leg(leg, raw_db, quote_cache)
     if not quote:
         _notify_mpp_ltp_price_unresolved(
             "MPP", f"No Dhan contract match for {leg.option_type} {leg.strike} exp={leg.expiry} — order NOT placed.",
@@ -397,7 +434,7 @@ async def _resolve_mpp_price(leg: "ManualOrderLeg", raw_db) -> float:
     return price
 
 
-async def _resolve_ltp_price(leg: "ManualOrderLeg", raw_db) -> float:
+async def _resolve_ltp_price(leg: "ManualOrderLeg", raw_db, quote_cache: dict[str, dict] | None = None) -> float:
     """
     "Execute At LTP" price source — same Dhan-feed-regardless-of-execution-broker principle as
     _resolve_mpp_price, just without the protection-band markup.
@@ -405,7 +442,7 @@ async def _resolve_ltp_price(leg: "ManualOrderLeg", raw_db) -> float:
     Returns 0.0 — never leg.price — if Dhan has no match/quote yet; see _resolve_mpp_price's
     docstring for why no fallback price is used here.
     """
-    quote = await _fetch_dhan_quote_for_leg(leg, raw_db)
+    quote = await _fetch_dhan_quote_for_leg(leg, raw_db, quote_cache)
     if not quote or quote["ltp"] <= 0:
         _notify_mpp_ltp_price_unresolved(
             "LTP", f"No Dhan quote for {leg.option_type} {leg.strike} exp={leg.expiry} — order NOT placed.",
@@ -430,6 +467,12 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
     try:
         raw_db = _shared_mongo._db
 
+        # One batched quote fetch for every MPP/LTP leg up front — see
+        # _batch_prefetch_dhan_quotes's docstring: resolving each leg's price
+        # independently (as before) serializes them behind Dhan's ~1.05s quote
+        # rate gate, adding roughly 1s per extra leg to a multi-leg order.
+        quote_cache = await _batch_prefetch_dhan_quotes(body.orders, raw_db)
+
         dhan_cfg = raw_db["kite_market_config"].find_one({"broker": "dhan"}) or {}
         if broker_id and broker_id == str(dhan_cfg.get("_id") or "").strip():
             dhan_client_id = str(dhan_cfg.get("user_id") or dhan_cfg.get("dhan_client_id") or "").strip()
@@ -453,13 +496,13 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
                 price = leg.price
                 requested_type = leg.order_type
                 if requested_type == "MPP":
-                    price = await _resolve_mpp_price(leg, raw_db)
+                    price = await _resolve_mpp_price(leg, raw_db, quote_cache)
                     if price <= 0:
                         print(f"[PLACE_ORDER][dhan] MPP price unresolved for leg={leg.model_dump()}", flush=True)
                         return {"leg": leg.model_dump(), "status": "error", "message": "MPP price unavailable — no live quote for this contract."}
                     requested_type = "LIMIT"
                 elif requested_type == "LTP":
-                    price = await _resolve_ltp_price(leg, raw_db)
+                    price = await _resolve_ltp_price(leg, raw_db, quote_cache)
                     if price <= 0:
                         print(f"[PLACE_ORDER][dhan] LTP price unresolved for leg={leg.model_dump()}", flush=True)
                         return {"leg": leg.model_dump(), "status": "error", "message": "LTP price unavailable — no live quote for this contract."}
@@ -478,12 +521,19 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
                     price=price,
                     trigger_price=leg.trigger_price or 0.0,
                     context={"purpose": "manual_order_pad", "broker": "dhan", "symbol": resolved["symbol"]},
+                    broker_kwargs={"security_id": resolved["security_id"], "exchange_segment": resolved["exchange_segment"]},
                 )
                 if result["status"] != "success":
                     return {"leg": leg.model_dump(), "status": "error", "message": result["message"]}
-                return {"leg": leg.model_dump(), "status": "success", "order_id": result["order_id"]}
+                return {
+                    "leg": leg.model_dump(), "status": "success", "order_id": result["order_id"],
+                    "broker_status": result.get("broker_status", "UNKNOWN"),
+                    "average_price": result.get("average_price"),
+                    "filled_quantity": result.get("filled_quantity"),
+                }
 
-            dhan_results: list[dict] = await asyncio.gather(*(_place_one_dhan_leg(leg) for leg in body.orders))
+            from features.order_execution import place_legs_hedge_ordered
+            dhan_results: list[dict] = await place_legs_hedge_ordered(body.orders, _place_one_dhan_leg)
 
             any_ok = any(r["status"] == "success" for r in dhan_results)
             all_ok = bool(dhan_results) and all(r["status"] == "success" for r in dhan_results)
@@ -527,13 +577,13 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
                 price = leg.price
                 order_type = leg.order_type
                 if order_type == "MPP":
-                    price = await _resolve_mpp_price(leg, raw_db)
+                    price = await _resolve_mpp_price(leg, raw_db, quote_cache)
                     if price <= 0:
                         print(f"[PLACE_ORDER][flattrade] MPP price unresolved for leg={leg.model_dump()}", flush=True)
                         return {"leg": leg.model_dump(), "status": "error", "message": "MPP price unavailable — no live quote for this contract."}
                     order_type = "LIMIT"
                 elif order_type == "LTP":
-                    price = await _resolve_ltp_price(leg, raw_db)
+                    price = await _resolve_ltp_price(leg, raw_db, quote_cache)
                     if price <= 0:
                         print(f"[PLACE_ORDER][flattrade] LTP price unresolved for leg={leg.model_dump()}", flush=True)
                         return {"leg": leg.model_dump(), "status": "error", "message": "LTP price unavailable — no live quote for this contract."}
@@ -562,9 +612,15 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
                 print(f"[PLACE_ORDER][flattrade] response={result}", flush=True)
                 if result["status"] != "success":
                     return {"leg": leg.model_dump(), "status": "error", "message": result["message"]}
-                return {"leg": leg.model_dump(), "status": "success", "order_id": result["order_id"]}
+                return {
+                    "leg": leg.model_dump(), "status": "success", "order_id": result["order_id"],
+                    "broker_status": result.get("broker_status", "UNKNOWN"),
+                    "average_price": result.get("average_price"),
+                    "filled_quantity": result.get("filled_quantity"),
+                }
 
-            results = await asyncio.gather(*(_place_one_flattrade_leg(leg) for leg in body.orders))
+            from features.order_execution import place_legs_hedge_ordered
+            results = await place_legs_hedge_ordered(body.orders, _place_one_flattrade_leg)
         else:
             from kiteconnect import KiteConnect  # type: ignore
 
@@ -586,13 +642,13 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
                 price = leg.price
                 order_type = leg.order_type
                 if order_type == "MPP":
-                    price = await _resolve_mpp_price(leg, raw_db)
+                    price = await _resolve_mpp_price(leg, raw_db, quote_cache)
                     if price <= 0:
                         print(f"[PLACE_ORDER][kite] MPP price unresolved for leg={leg.model_dump()}", flush=True)
                         return {"leg": leg.model_dump(), "status": "error", "message": "MPP price unavailable — no live quote for this contract."}
                     order_type = "LIMIT"
                 elif order_type == "LTP":
-                    price = await _resolve_ltp_price(leg, raw_db)
+                    price = await _resolve_ltp_price(leg, raw_db, quote_cache)
                     if price <= 0:
                         print(f"[PLACE_ORDER][kite] LTP price unresolved for leg={leg.model_dump()}", flush=True)
                         return {"leg": leg.model_dump(), "status": "error", "message": "LTP price unavailable — no live quote for this contract."}
@@ -622,9 +678,15 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
                 print(f"[PLACE_ORDER][kite] response={result}", flush=True)
                 if result["status"] != "success":
                     return {"leg": leg.model_dump(), "status": "error", "message": result["message"]}
-                return {"leg": leg.model_dump(), "status": "success", "order_id": result["order_id"]}
+                return {
+                    "leg": leg.model_dump(), "status": "success", "order_id": result["order_id"],
+                    "broker_status": result.get("broker_status", "UNKNOWN"),
+                    "average_price": result.get("average_price"),
+                    "filled_quantity": result.get("filled_quantity"),
+                }
 
-            results = await asyncio.gather(*(_place_one_kite_leg(leg) for leg in body.orders))
+            from features.order_execution import place_legs_hedge_ordered
+            results = await place_legs_hedge_ordered(body.orders, _place_one_kite_leg)
 
         any_ok = any(r["status"] == "success" for r in results)
         all_ok = bool(results) and all(r["status"] == "success" for r in results)
@@ -639,14 +701,75 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
         return {"status": "error", "message": str(exc), "results": []}
 
 
-@order_router.post("/trade/positions/place-order")
-async def simulator_place_manual_order(body: ManualOrderRequest, current_user: dict = Depends(app_auth.get_current_user)) -> dict:
+def _persist_manual_order_pad_orders(body: "ManualOrderRequest", result: dict, current_user: dict) -> None:
     """
-    Same route + wrapper as algo.trade's and algo.simulator's own copies (all
-    three call the identical _simulator_place_manual_order_core) — this is
-    now the one the Order Pad's "Trade"/Execute button posts to (ORDER_API_BASE).
+    Logs every Order Pad leg to `manual_order_pad_orders` — success or error alike,
+    since this places real money and a broker rejection is exactly the kind of thing
+    that must survive a missed toast/refresh, not just live in the HTTP response.
+    Tracked per broker_id + position (underlying/expiry/strike/option_type) + leg_id
+    (the Order Pad row id the frontend sent) so a specific order's outcome can always
+    be traced back to the specific leg it belongs to.
+
+    Also backfills each entry in result["results"] with db_id/placed_at (and leg_id,
+    for entries the core placement function already built) — including synthesizing
+    an entry for every ordered leg when the core function bailed out before per-leg
+    placement (e.g. "Broker account not found") and returned results=[], so the
+    caller always gets one result per requested leg, never a short/empty list.
+    """
+    col = _shared_mongo._db["manual_order_pad_orders"]
+    now_str = datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
+    user_id = str(current_user.get("_id") or "")
+    overall_status = str(result.get("status") or "error")
+    overall_message = str(result.get("message") or "")
+    leg_results: list = result.get("results") or []
+    synced_results: list = []
+    for i, leg in enumerate(body.orders):
+        leg_result = dict(leg_results[i]) if i < len(leg_results) else {
+            "leg": leg.model_dump(), "status": overall_status, "message": overall_message,
+        }
+        doc = {
+            "user_id": user_id,
+            "broker_id": body.broker_id,
+            "leg_id": leg.leg_id,
+            "underlying": leg.underlying,
+            "expiry": leg.expiry,
+            "strike": leg.strike,
+            "option_type": leg.option_type,
+            "side": leg.side,
+            "quantity": leg.quantity,
+            "order_type": leg.order_type,
+            "product": leg.product,
+            "price": leg.price,
+            "trigger_price": leg.trigger_price,
+            "status": str(leg_result.get("status") or overall_status),
+            "order_id": str(leg_result.get("order_id") or ""),
+            "message": str(leg_result.get("message") or ""),
+            "placed_at": now_str,
+        }
+        try:
+            inserted = col.insert_one(doc)
+            leg_result["db_id"] = str(inserted.inserted_id)
+        except Exception as exc:
+            print(f"[PLACE_ORDER] db persist failed leg_id={leg.leg_id} error={exc}", flush=True)
+        leg_result["placed_at"] = now_str
+        leg_result.setdefault("leg_id", leg.leg_id)
+        synced_results.append(leg_result)
+    result["results"] = synced_results
+
+
+async def _place_manual_order_and_notify(body: ManualOrderRequest, user_id: str) -> dict:
+    """
+    Shared by the user-facing route (JWT auth, Order Pad) and the internal
+    server-to-server route (X-Internal-Token auth, webhook-triggered strategy
+    creation + the live SL/TG adjustment monitor) — same DB logging + Telegram
+    notify either way, since a live order is a live order regardless of who or
+    what triggered it.
     """
     result = await _simulator_place_manual_order_core(body)
+    try:
+        _persist_manual_order_pad_orders(body, result, {"_id": user_id})
+    except Exception as exc:
+        print(f"[PLACE_ORDER] db persist error={exc}", flush=True)
     try:
         from features.telegram_notifier import notify_user
 
@@ -665,6 +788,31 @@ async def simulator_place_manual_order(body: ManualOrderRequest, current_user: d
     except Exception as exc:
         print(f"[PLACE_ORDER] telegram notify error={exc}", flush=True)
     return result
+
+
+@order_router.post("/trade/positions/place-order")
+async def simulator_place_manual_order(body: ManualOrderRequest, current_user: dict = Depends(app_auth.get_current_user)) -> dict:
+    """
+    Same route + wrapper as algo.trade's and algo.simulator's own copies (all
+    three call the identical _simulator_place_manual_order_core) — this is
+    now the one the Order Pad's "Trade"/Execute button posts to (ORDER_API_BASE).
+    """
+    return await _place_manual_order_and_notify(body, str(current_user.get("_id") or ""))
+
+
+@order_router.post("/internal/place-order")
+async def internal_place_manual_order(body: ManualOrderRequest, _: None = Depends(_verify_internal_token)) -> dict:
+    """
+    Same place-order flow as simulator_place_manual_order, for server-to-server
+    callers with no logged-in user to hold a JWT — webhook-triggered strategy
+    creation (algo.simulator's _simulator_pt_webhook_create_strategy) and the
+    live SL/TG adjustment monitor (simulator_risk_monitor.py's
+    _fire_broker_adjustment) call this instead of placing the order in-process
+    on their own box. This is what makes every live order, regardless of which
+    service/box actually initiated it, talk to the broker from THIS box — the
+    one whitelisted with Dhan for live order placement.
+    """
+    return await _place_manual_order_and_notify(body, "internal-service")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1140,6 +1288,7 @@ class BrokerPlaceOrderRequest(BaseModel):
     trigger_price: float = 0.0
     validity: str = "DAY"
     context: dict = {}
+    broker_kwargs: dict = {}
 
 
 class BrokerCancelOrderRequest(BaseModel):
@@ -1157,6 +1306,123 @@ class BrokerModifyOrderRequest(BaseModel):
     exchange: str
     tradingsymbol: str
     quantity: int
+
+
+@order_router.get("/broker/orders")
+async def get_broker_orders(broker_id: str = Query(...), current_user: dict = Depends(app_auth.get_current_user)) -> dict:
+    """
+    Returns this broker account's order book straight from Dhan/Kite/FlatTrade's
+    own orders() API — not our own DB snapshot — so the Orders tab shows the
+    broker's real, current status (COMPLETE/OPEN/REJECTED/CANCELLED/TRIGGER
+    PENDING) for every order, live. Every broker's own order-book endpoint already
+    only returns the current trading day's orders, so no separate date filter
+    needed here — reusing the same _resolve_broker_adapter the internal /broker/
+    place gateway uses, just with user-JWT auth instead of the internal token
+    (this is a user opening a tab in the UI, not a server-to-server call).
+    """
+    raw_db = _shared_mongo._db
+    adapter = await asyncio.to_thread(_resolve_broker_adapter, raw_db, broker_id)
+    if not adapter:
+        return {"status": "error", "message": "Broker not resolved.", "orders": []}
+    try:
+        orders = await asyncio.to_thread(adapter.orders)
+    except Exception as exc:
+        return {"status": "error", "message": str(exc), "orders": []}
+    return {"status": "success", "orders": orders}
+
+
+class RetryOrderRequest(BaseModel):
+    broker_id: str
+    tradingsymbol: str
+    exchange: str
+    transaction_type: str
+    quantity: int
+    product: str
+    price: float = 0.0
+    trigger_price: float = 0.0
+
+
+@order_router.post("/trade/positions/retry-order")
+async def retry_broker_order(body: RetryOrderRequest, current_user: dict = Depends(app_auth.get_current_user)) -> dict:
+    """
+    Re-places a REJECTED/CANCELLED order from the Orders tab (see
+    get_broker_orders above) as a brand-new order — once a broker has
+    terminated an order there is nothing left to modify, so this is the only
+    option for those two statuses (an OPEN/TRIGGER_PENDING order should hit
+    modify_broker_order below instead, same order_id, no duplicate). Same
+    {"order_id","status","message","raw"} contract as broker_place_order
+    below, just reachable with a user JWT (that one's server-to-server only)
+    since this is a user clicking "Retry" in the UI.
+
+    order_type isn't available here — neither adapter's orders() (dhan_broker.py
+    /flattrade_broker.py) returns the original order type, only price/trigger_price
+    — so it's inferred the same way a trader would read the row back: a
+    trigger_price means it was a stop-loss order, a price with no trigger means
+    LIMIT, and neither means MARKET.
+    """
+    raw_db = _shared_mongo._db
+    adapter = await asyncio.to_thread(_resolve_broker_adapter, raw_db, body.broker_id)
+    if not adapter:
+        return {"order_id": "", "status": "error", "message": "Broker not resolved.", "raw": None}
+    order_type = "SL" if body.trigger_price > 0 else ("LIMIT" if body.price > 0 else "MARKET")
+    from features.order_execution import place_broker_order
+    result = await asyncio.to_thread(
+        place_broker_order,
+        adapter,
+        tradingsymbol=body.tradingsymbol,
+        exchange=body.exchange,
+        transaction_type=body.transaction_type,
+        quantity=body.quantity,
+        order_type=order_type,
+        product=body.product,
+        price=body.price,
+        trigger_price=body.trigger_price,
+        context={"user_id": str(current_user.get("_id") or ""), "retry": True},
+    )
+    return result
+
+
+class ModifyOrderRequest(BaseModel):
+    broker_id: str
+    order_id: str
+    tradingsymbol: str
+    exchange: str
+    quantity: int
+    price: float = 0.0
+    trigger_price: float = 0.0
+
+
+@order_router.post("/trade/positions/modify-order")
+async def modify_broker_order(body: ModifyOrderRequest, current_user: dict = Depends(app_auth.get_current_user)) -> dict:
+    """
+    Sensibull-style "retry a stuck order" — an order still OPEN/TRIGGER_PENDING
+    at the broker is still live and modifiable, so re-send it as a modify on
+    the SAME order_id instead of retry_broker_order's place-a-new-order path
+    (which would leave two live orders for one leg). User-JWT-reachable twin
+    of broker_modify_order below (that one's server-to-server only).
+
+    order_type inferred from price/trigger_price the same way retry_broker_order
+    does — the broker's order-book response never echoes back the original type.
+    """
+    raw_db = _shared_mongo._db
+    adapter = await asyncio.to_thread(_resolve_broker_adapter, raw_db, body.broker_id)
+    if not adapter:
+        return {"status": "error", "message": "Broker not resolved."}
+    order_type = "SL" if body.trigger_price > 0 else ("LIMIT" if body.price > 0 else "MARKET")
+    try:
+        new_order_id = await asyncio.to_thread(
+            adapter.modify_order,
+            order_id=body.order_id,
+            order_type=order_type,
+            price=body.price,
+            trigger_price=body.trigger_price,
+            exchange=body.exchange,
+            tradingsymbol=body.tradingsymbol,
+            quantity=body.quantity,
+        )
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+    return {"status": "success", "order_id": new_order_id}
 
 
 @order_router.post("/broker/place")
@@ -1187,6 +1453,7 @@ async def broker_place_order(body: BrokerPlaceOrderRequest, _: None = Depends(_v
         trigger_price=body.trigger_price,
         validity=body.validity,
         context=body.context,
+        broker_kwargs=body.broker_kwargs,
     )
     return result
 
