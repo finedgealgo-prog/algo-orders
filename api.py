@@ -391,17 +391,14 @@ def _notify_mpp_ltp_price_unresolved(kind: str, message: str) -> None:
 
 async def _resolve_mpp_price(leg: "ManualOrderLeg", raw_db, quote_cache: dict[str, dict] | None = None) -> float:
     """
-    MPP's bid + protection% / ask - protection% formula, priced off Dhan's feed regardless of
-    the execution broker (see _fetch_dhan_quote_for_leg).
+    MPP's price source: Dhan's live LTP (see _fetch_dhan_quote_for_leg), priced off Dhan's feed
+    regardless of the execution broker. Placed to the broker as a plain LIMIT order at this
+    price — no bid/ask protection-band markup.
 
-    Returns 0.0 — NEVER leg.price or ltp as a stand-in for a missing bid/ask — when Dhan has
-    no contract match or no live depth on the side this leg needs. Every caller already
-    treats a <= 0 return as "unresolved" and aborts the order instead of placing it;
-    substituting ltp here would silently hand back a fabricated "protected" price with no
-    real depth behind it — exactly the risk that made this whole function worth having.
+    Returns 0.0 — never leg.price as a stand-in — when Dhan has no contract match or no live
+    LTP yet. Every caller already treats a <= 0 return as "unresolved" and aborts the order
+    instead of placing it.
     """
-    from features.live_order_manager import _mpp_protection_pct, _clamp_limit_price
-
     quote = await _fetch_dhan_quote_for_leg(leg, raw_db, quote_cache)
     if not quote:
         _notify_mpp_ltp_price_unresolved(
@@ -410,37 +407,23 @@ async def _resolve_mpp_price(leg: "ManualOrderLeg", raw_db, quote_cache: dict[st
         return 0.0
 
     ltp = quote["ltp"]
-    bid = quote["bid"]
-    ask = quote["ask"]
-    is_buy = leg.side == "BUY"
-    # Only the side this order actually needs (bid for BUY, ask for SELL) has to be live —
-    # but never substitute ltp for it if it's missing.
-    if (is_buy and bid <= 0) or (not is_buy and ask <= 0):
+    if ltp <= 0:
         _notify_mpp_ltp_price_unresolved(
-            "MPP",
-            f"No live depth for {quote.get('symbol')} (bid={bid}, ask={ask}) — order NOT placed.",
+            "MPP", f"No live LTP for {quote.get('symbol')} — order NOT placed.",
         )
         return 0.0
 
-    pct = _mpp_protection_pct(ltp, is_option=leg.option_type.strip().upper() != "FUT")
-    base_price = bid if is_buy else ask
-    raw_price = base_price * (1 + pct / 100) if is_buy else base_price * (1 - pct / 100)
-    price = _clamp_limit_price(raw_price, is_buy)
-    print(
-        f"[MPP PRICE][dhan-feed] symbol={quote['symbol']} ltp={ltp} bid={bid} ask={ask} "
-        f"pct={pct}% price={price} is_buy={is_buy}",
-        flush=True,
-    )
-    return price
+    print(f"[MPP PRICE][dhan-feed] symbol={quote['symbol']} ltp={ltp} price={ltp}", flush=True)
+    return ltp
 
 
 async def _resolve_ltp_price(leg: "ManualOrderLeg", raw_db, quote_cache: dict[str, dict] | None = None) -> float:
     """
     "Execute At LTP" price source — same Dhan-feed-regardless-of-execution-broker principle as
-    _resolve_mpp_price, just without the protection-band markup.
+    _resolve_mpp_price (both just return live LTP; kept as separate order types since the UI
+    exposes them separately).
 
-    Returns 0.0 — never leg.price — if Dhan has no match/quote yet; see _resolve_mpp_price's
-    docstring for why no fallback price is used here.
+    Returns 0.0 — never leg.price — if Dhan has no match/quote yet.
     """
     quote = await _fetch_dhan_quote_for_leg(leg, raw_db, quote_cache)
     if not quote or quote["ltp"] <= 0:
