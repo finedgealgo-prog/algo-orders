@@ -21,8 +21,10 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -31,7 +33,7 @@ from dotenv import load_dotenv
 load_dotenv(_pathlib.Path(__file__).resolve().parent / ".env")
 
 from bson import ObjectId
-from fastapi import Depends, FastAPI, APIRouter, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, APIRouter, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -58,6 +60,107 @@ _simulator_strategy_col = _shared_mongo._db["simulator_strategy"]
 # below) — algo.trade's live_order_manager.py calls those routes with no logged-in
 # user/JWT, so they can't use app_auth.get_current_user like every other route here.
 INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+
+
+# ── Order-update push (Dhan's Live Order Update WS relayed to the Order Pad/Orderbook) ──
+# _app_loop is captured at startup so _on_dhan_order_alert (called from the Dhan WS's own
+# thread — see dhan_order_update.py) can hop back onto the FastAPI event loop to actually
+# send on the browser sockets, same bridge pattern as algo.websocket/ws_main.py's
+# _InternalTickHub for tick data.
+_app_loop: "asyncio.AbstractEventLoop | None" = None
+_order_update_sockets: dict[str, list] = {}
+_order_update_sockets_lock = threading.Lock()
+
+
+def _register_order_update_socket(broker_id: str, ws: WebSocket) -> None:
+    with _order_update_sockets_lock:
+        _order_update_sockets.setdefault(broker_id, []).append(ws)
+
+
+def _unregister_order_update_socket(broker_id: str, ws: WebSocket) -> None:
+    with _order_update_sockets_lock:
+        sockets = _order_update_sockets.get(broker_id)
+        if sockets and ws in sockets:
+            sockets.remove(ws)
+            if not sockets:
+                _order_update_sockets.pop(broker_id, None)
+
+
+async def _broadcast_order_update(broker_id: str, message: dict) -> None:
+    with _order_update_sockets_lock:
+        sockets = list(_order_update_sockets.get(broker_id, []))
+    dead = []
+    for ws in sockets:
+        try:
+            await ws.send_json(message)
+        except Exception:
+            dead.append(ws)
+    if dead:
+        for ws in dead:
+            _unregister_order_update_socket(broker_id, ws)
+
+
+def _on_dhan_order_alert(entry: dict) -> None:
+    # Runs on the Dhan order-update WS's own thread — every connected socket currently
+    # gets the update regardless of which broker_id it registered with, since this app
+    # only ever has one enabled Dhan account at a time (matches dhan_ticker_manager's own
+    # single-account assumption elsewhere in this codebase).
+    if _app_loop is None or not _order_update_sockets:
+        return
+    for broker_id in list(_order_update_sockets.keys()):
+        asyncio.run_coroutine_threadsafe(_broadcast_order_update(broker_id, entry), _app_loop)
+
+
+@app.on_event("startup")
+async def _auto_start_order_update_ws() -> None:
+    global _app_loop
+    _app_loop = asyncio.get_event_loop()
+
+    # Every blocking broker REST call in this service (place_order, orders(), quote
+    # fetches, Mongo lookups run off the loop) goes through asyncio.to_thread, which uses
+    # this loop's default executor — Python's own default caps that pool at
+    # min(32, cpu_count()+4), meaning as few as 5-6 workers on a small box. That's a real
+    # ceiling on how many legs of one basket (e.g. a 10-leg order) can actually place
+    # concurrently: legs beyond the pool size queue behind earlier ones instead of firing
+    # together, regardless of place_legs_hedge_ordered's own asyncio.gather batching.
+    # Raised here since these are short I/O-bound waits (network round trips), not
+    # CPU-bound work — a bigger pool costs idle-thread memory, not CPU.
+    _app_loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=32))
+
+    async def _bg():
+        await asyncio.sleep(2)
+        try:
+            from features.dhan_order_update import dhan_order_update_manager
+            dhan_order_update_manager.add_update_listener(_on_dhan_order_alert)
+            dhan_order_update_manager.start(_shared_mongo._db)
+        except Exception:
+            log.exception("[STARTUP] Dhan order-update WS auto-start failed.")
+
+    asyncio.create_task(_bg())
+
+
+@order_router.websocket("/ws/order-updates")
+async def order_updates_socket(websocket: WebSocket, broker_id: str = Query(default="")) -> None:
+    """
+    Instant order-status push for the Order Pad / Orderbook — Dhan's own Live Order
+    Update WS (see features.dhan_order_update) relayed straight through, replacing their
+    old poll-GET-/broker/orders-every-4s loop with a true push the moment Dhan emits a
+    status change (COMPLETE/REJECTED/CANCELLED/TRIGGER_PENDING/OPEN).
+    """
+    await websocket.accept()
+    if not broker_id:
+        await websocket.close()
+        return
+    _register_order_update_socket(broker_id, websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        _unregister_order_update_socket(broker_id, websocket)
 
 
 def _verify_internal_token(x_internal_token: str = Header(default="")) -> None:
@@ -106,6 +209,12 @@ class ManualOrderLeg(BaseModel):
     leg_id: str = ""        # Order Pad row id (client-generated) — echoed back so the
                              # frontend can match each result to its exact row/leg instead
                              # of relying on array order.
+    security_id: str = ""   # Dhan security_id, when the frontend already has it (Order Pad
+                             # rows carry it as `token` off the same active_option_tokens/
+                             # broker=dhan feed _resolve_dhan_security would otherwise
+                             # re-query). Optional — empty/wrong falls back to the Mongo
+                             # lookup, so this is a pure speed optimization, never trusted
+                             # blindly for correctness.
 
 
 class ManualOrderRequest(BaseModel):
@@ -471,7 +580,18 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
             dhan_adapter = get_dhan_instance(_shared_mongo, dhan_client_id, dhan_access_token)
 
             async def _place_one_dhan_leg(leg: "ManualOrderLeg") -> dict:
-                resolved = await asyncio.to_thread(_resolve_dhan_security, leg, raw_db)
+                # Frontend-supplied security_id skips the Mongo round trip entirely — see
+                # ManualOrderLeg.security_id's docstring. exchange_segment isn't sent by the
+                # client, so this uses the same "NSE_FNO" default _resolve_dhan_security itself
+                # falls back to when a contract's ws_segment isn't set.
+                if leg.security_id.strip():
+                    resolved = {
+                        "security_id": leg.security_id.strip(),
+                        "symbol": f"{leg.underlying} {leg.strike:g}{leg.option_type}",
+                        "exchange_segment": "NSE_FNO",
+                    }
+                else:
+                    resolved = await asyncio.to_thread(_resolve_dhan_security, leg, raw_db)
                 if not resolved:
                     print(f"[PLACE_ORDER][dhan] instrument not found for leg={leg.model_dump()}", flush=True)
                     return {"leg": leg.model_dump(), "status": "error", "message": "Instrument not found."}
@@ -505,6 +625,7 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
                     trigger_price=leg.trigger_price or 0.0,
                     context={"purpose": "manual_order_pad", "broker": "dhan", "symbol": resolved["symbol"]},
                     broker_kwargs={"security_id": resolved["security_id"], "exchange_segment": resolved["exchange_segment"]},
+                    check_status=False,
                 )
                 if result["status"] != "success":
                     return {"leg": leg.model_dump(), "status": "error", "message": result["message"]}
@@ -591,6 +712,7 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
                     price=price,
                     trigger_price=leg.trigger_price,
                     context={"purpose": "manual_order_pad", "broker": "flattrade", "symbol": symbol},
+                    check_status=False,
                 )
                 print(f"[PLACE_ORDER][flattrade] response={result}", flush=True)
                 if result["status"] != "success":
@@ -657,6 +779,7 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
                     trigger_price=leg.trigger_price or 0.0,
                     variety=kite.VARIETY_REGULAR,
                     context={"purpose": "manual_order_pad", "broker": "kite", "symbol": symbol},
+                    check_status=False,
                 )
                 print(f"[PLACE_ORDER][kite] response={result}", flush=True)
                 if result["status"] != "success":
@@ -706,11 +829,12 @@ def _persist_manual_order_pad_orders(body: "ManualOrderRequest", result: dict, c
     overall_message = str(result.get("message") or "")
     leg_results: list = result.get("results") or []
     synced_results: list = []
+    docs: list = []
     for i, leg in enumerate(body.orders):
         leg_result = dict(leg_results[i]) if i < len(leg_results) else {
             "leg": leg.model_dump(), "status": overall_status, "message": overall_message,
         }
-        doc = {
+        docs.append({
             "user_id": user_id,
             "broker_id": body.broker_id,
             "leg_id": leg.leg_id,
@@ -728,15 +852,24 @@ def _persist_manual_order_pad_orders(body: "ManualOrderRequest", result: dict, c
             "order_id": str(leg_result.get("order_id") or ""),
             "message": str(leg_result.get("message") or ""),
             "placed_at": now_str,
-        }
-        try:
-            inserted = col.insert_one(doc)
-            leg_result["db_id"] = str(inserted.inserted_id)
-        except Exception as exc:
-            print(f"[PLACE_ORDER] db persist failed leg_id={leg.leg_id} error={exc}", flush=True)
+        })
         leg_result["placed_at"] = now_str
         leg_result.setdefault("leg_id", leg.leg_id)
         synced_results.append(leg_result)
+
+    # One batched insert_many instead of N sequential insert_one round trips — this
+    # function runs synchronously on the event loop (see _place_manual_order_and_notify's
+    # asyncio.to_thread wrapper), so N Mongo round trips here used to mean N * mongo-
+    # latency of the whole process being unable to serve any other request, on top of
+    # delaying this response — the same "blocking sync pymongo call in an async path"
+    # class of bug fixed elsewhere in this codebase (shared/chart_api.py, etc.).
+    if docs:
+        try:
+            inserted = col.insert_many(docs, ordered=True)
+            for leg_result, inserted_id in zip(synced_results, inserted.inserted_ids):
+                leg_result["db_id"] = str(inserted_id)
+        except Exception as exc:
+            print(f"[PLACE_ORDER] db persist failed error={exc}", flush=True)
     result["results"] = synced_results
 
 
@@ -750,7 +883,7 @@ async def _place_manual_order_and_notify(body: ManualOrderRequest, user_id: str)
     """
     result = await _simulator_place_manual_order_core(body)
     try:
-        _persist_manual_order_pad_orders(body, result, {"_id": user_id})
+        await asyncio.to_thread(_persist_manual_order_pad_orders, body, result, {"_id": user_id})
     except Exception as exc:
         print(f"[PLACE_ORDER] db persist error={exc}", flush=True)
     try:
@@ -1406,6 +1539,75 @@ async def modify_broker_order(body: ModifyOrderRequest, current_user: dict = Dep
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
     return {"status": "success", "order_id": new_order_id}
+
+
+class RepeatOrderRequest(BaseModel):
+    broker_id: str
+    security_id: str
+    exchange_segment: str
+    tradingsymbol: str
+    exchange: str
+    transaction_type: str
+    quantity: int
+    product: str
+    order_type: str          # "MARKET" / "LIMIT" / "MPP" / "LTP"
+    price: float = 0.0
+    trigger_price: float = 0.0
+
+
+@order_router.post("/trade/positions/repeat-order")
+async def repeat_broker_order(body: RepeatOrderRequest, current_user: dict = Depends(app_auth.get_current_user)) -> dict:
+    """
+    Orderbook's "repeat this order" action — always places a brand-new order (unlike
+    modify_broker_order, which reuses the same order_id for a still-live one). Dhan-only
+    for now (see feedback memory: broker features land per-file, incrementally): MPP/LTP
+    resolve Dhan's live feed straight off security_id/exchange_segment (both already sat
+    on the Orderbook row from DhanAdapter.orders()) instead of re-parsing underlying/
+    expiry/strike out of tradingSymbol — Dhan's own tradingSymbol doesn't reliably encode
+    which week's contract it is (see _resolve_dhan_security's docstring above), but
+    securityId always identifies the exact instrument the original order was for.
+    """
+    raw_db = _shared_mongo._db
+    dhan_cfg = raw_db["kite_market_config"].find_one({"broker": "dhan"}) or {}
+    if body.broker_id != str(dhan_cfg.get("_id") or "").strip():
+        return {"status": "error", "message": "Repeat Order currently supports Dhan accounts only.", "results": []}
+    dhan_client_id = str(dhan_cfg.get("user_id") or dhan_cfg.get("dhan_client_id") or "").strip()
+    dhan_access_token = str(dhan_cfg.get("access_token") or "").strip()
+    if not dhan_access_token or not dhan_client_id:
+        return {"status": "error", "message": "Dhan credentials not configured."}
+
+    price = body.price
+    dhan_order_type = body.order_type.upper()
+    if dhan_order_type in ("MPP", "LTP"):
+        quote = (await asyncio.to_thread(
+            _fetch_dhan_market_data, body.exchange_segment, [int(body.security_id)], _shared_mongo,
+        )).get(body.security_id, {})
+        ltp = float(quote.get("ltp") or 0)
+        if ltp <= 0:
+            print(f"[REPEAT_ORDER] no live {dhan_order_type} price for security_id={body.security_id}", flush=True)
+            return {"status": "error", "message": "No live price available for this contract — order NOT placed."}
+        price = ltp
+        dhan_order_type = "LIMIT"
+
+    from features.dhan_broker import get_dhan_instance
+    from features.order_execution import place_broker_order
+    dhan_adapter = get_dhan_instance(_shared_mongo, dhan_client_id, dhan_access_token)
+    result = await asyncio.to_thread(
+        place_broker_order,
+        dhan_adapter,
+        tradingsymbol=body.tradingsymbol,
+        exchange=body.exchange,
+        transaction_type=body.transaction_type,
+        quantity=body.quantity,
+        order_type=dhan_order_type,
+        product=body.product,
+        price=price,
+        trigger_price=body.trigger_price,
+        context={"purpose": "orderbook_repeat", "broker": "dhan", "symbol": body.tradingsymbol, "user_id": str(current_user.get("_id") or "")},
+        broker_kwargs={"security_id": body.security_id, "exchange_segment": body.exchange_segment},
+        check_status=False,
+    )
+    return result
 
 
 @order_router.post("/broker/place")
