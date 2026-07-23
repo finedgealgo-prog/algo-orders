@@ -25,6 +25,8 @@ import concurrent.futures
 import logging
 import os
 import threading
+
+import requests
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -33,7 +35,7 @@ from dotenv import load_dotenv
 load_dotenv(_pathlib.Path(__file__).resolve().parent / ".env")
 
 from bson import ObjectId
-from fastapi import Depends, FastAPI, APIRouter, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, APIRouter, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -60,6 +62,16 @@ _simulator_strategy_col = _shared_mongo._db["simulator_strategy"]
 # below) — algo.trade's live_order_manager.py calls those routes with no logged-in
 # user/JWT, so they can't use app_auth.get_current_user like every other route here.
 INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+
+# Dev bridge: when set, THIS box's place-order route forwards the request as-is to the
+# live server and returns whatever it responds with, instead of placing the order itself
+# — for a local/dev box that can't reach the broker (no whitelisted IP, no live
+# credentials) but still needs a real order_id to develop/test status-tracking, MPP
+# pricing logs, etc. against. Every OTHER route (status polling, order book, the
+# order-updates socket) still runs fully local — only placement is redirected. Off
+# (LIVE_ORDER_PLACEMENT unset/false) behaves exactly as before: places for real, right here.
+LIVE_ORDER_PLACEMENT = os.getenv("LIVE_ORDER_PLACEMENT", "false").strip().lower() == "true"
+LIVE_ORDER_BASE_URL = os.getenv("LIVE_ORDER_BASE_URL", "https://order.finedgealgo.com/order").rstrip("/")
 
 
 # ── Order-update push (broker order-status pushed straight to the Order Pad/Orderbook) ──
@@ -1016,12 +1028,36 @@ async def _place_manual_order_and_notify(body: ManualOrderRequest, user_id: str)
 
 
 @order_router.post("/trade/positions/place-order")
-async def simulator_place_manual_order(body: ManualOrderRequest, current_user: dict = Depends(app_auth.get_current_user)) -> dict:
+async def simulator_place_manual_order(
+    body: ManualOrderRequest, request: Request, current_user: dict = Depends(app_auth.get_current_user_for_order_placement),
+) -> dict:
     """
     Same route + wrapper as algo.trade's and algo.simulator's own copies (all
     three call the identical _simulator_place_manual_order_core) — this is
     now the one the Order Pad's "Trade"/Execute button posts to (ORDER_API_BASE).
+
+    LIVE_ORDER_PLACEMENT (see its own comment near INTERNAL_SERVICE_TOKEN): when set,
+    forwards straight to the live server instead of placing here — placement only, every
+    other route on this box is untouched.
     """
+    if LIVE_ORDER_PLACEMENT:
+        auth_header = request.headers.get("authorization", "")
+
+        def _forward() -> dict:
+            resp = requests.post(
+                f"{LIVE_ORDER_BASE_URL}/trade/positions/place-order",
+                json=body.model_dump(),
+                headers={"Authorization": auth_header, "Content-Type": "application/json"},
+                timeout=30,
+            )
+            return resp.json()
+
+        try:
+            return await asyncio.to_thread(_forward)
+        except Exception as exc:
+            log.error("[LIVE_ORDER_PLACEMENT] forward to %s failed: %s", LIVE_ORDER_BASE_URL, exc)
+            return {"status": "error", "message": f"Live order forward failed: {exc}", "results": []}
+
     return await _place_manual_order_and_notify(body, str(current_user.get("_id") or ""))
 
 
