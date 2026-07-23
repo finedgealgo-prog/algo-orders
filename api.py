@@ -162,22 +162,29 @@ async def order_updates_socket(websocket: WebSocket, broker_id: str = Query(defa
 
     dhan_listener = None
     dhan_conn = None
-    dhan_account = await asyncio.to_thread(_resolve_dhan_account_for_broker_id, broker_id)
-    if dhan_account:
-        from features.dhan_order_update import dhan_order_update_pool
-        client_id, access_token = dhan_account
-        dhan_conn = await asyncio.to_thread(dhan_order_update_pool.ensure_started, client_id, access_token)
-        if dhan_conn is not None:
-            loop = asyncio.get_event_loop()
+    try:
+        # Any failure here (Mongo hiccup, pool/thread error) must not crash the whole
+        # handler before the receive loop even starts — that would skip straight to the
+        # outer finally with no chance to log why, and the browser just sees the socket
+        # die instantly and reconnect-loop forever with no clue what happened server-side.
+        dhan_account = await asyncio.to_thread(_resolve_dhan_account_for_broker_id, broker_id)
+        if dhan_account:
+            from features.dhan_order_update import dhan_order_update_pool
+            client_id, access_token = dhan_account
+            dhan_conn = await asyncio.to_thread(dhan_order_update_pool.ensure_started, client_id, access_token)
+            if dhan_conn is not None:
+                loop = asyncio.get_event_loop()
 
-            def _forward(entry: dict) -> None:
-                # Runs on the Dhan WS's own thread — hop back onto this route's event loop
-                # to actually send. Scoped to this one broker_id/account pair, unlike the
-                # old app-wide broadcast.
-                asyncio.run_coroutine_threadsafe(_broadcast_order_update(broker_id, entry), loop)
+                def _forward(entry: dict) -> None:
+                    # Runs on the Dhan WS's own thread — hop back onto this route's event
+                    # loop to actually send. Scoped to this one broker_id/account pair,
+                    # unlike the old app-wide broadcast.
+                    asyncio.run_coroutine_threadsafe(_broadcast_order_update(broker_id, entry), loop)
 
-            dhan_listener = _forward
-            dhan_conn.add_update_listener(dhan_listener)
+                dhan_listener = _forward
+                dhan_conn.add_update_listener(dhan_listener)
+    except Exception:
+        log.exception("[ORDER UPDATE WS] Dhan connection setup failed broker_id=%s — continuing without push for it.", broker_id)
 
     try:
         while True:
