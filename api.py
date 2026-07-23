@@ -62,11 +62,11 @@ _simulator_strategy_col = _shared_mongo._db["simulator_strategy"]
 INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
 
 
-# ── Order-update push (Dhan's Live Order Update WS relayed to the Order Pad/Orderbook) ──
-# _app_loop is captured at startup so _on_dhan_order_alert (called from the Dhan WS's own
-# thread — see dhan_order_update.py) can hop back onto the FastAPI event loop to actually
-# send on the browser sockets, same bridge pattern as algo.websocket/ws_main.py's
-# _InternalTickHub for tick data.
+# ── Order-update push (broker order-status pushed straight to the Order Pad/Orderbook) ──
+# _app_loop is captured at startup so a push listener (called from another thread — e.g.
+# dhan_order_update.py's per-account WS, or an internal broadcast route for postback-based
+# brokers) can hop back onto the FastAPI event loop to actually send on the browser sockets,
+# same bridge pattern as algo.websocket/ws_main.py's _InternalTickHub for tick data.
 _app_loop: "asyncio.AbstractEventLoop | None" = None
 _order_update_sockets: dict[str, list] = {}
 _order_update_sockets_lock = threading.Lock()
@@ -100,19 +100,30 @@ async def _broadcast_order_update(broker_id: str, message: dict) -> None:
             _unregister_order_update_socket(broker_id, ws)
 
 
-def _on_dhan_order_alert(entry: dict) -> None:
-    # Runs on the Dhan order-update WS's own thread — every connected socket currently
-    # gets the update regardless of which broker_id it registered with, since this app
-    # only ever has one enabled Dhan account at a time (matches dhan_ticker_manager's own
-    # single-account assumption elsewhere in this codebase).
-    if _app_loop is None or not _order_update_sockets:
-        return
-    for broker_id in list(_order_update_sockets.keys()):
-        asyncio.run_coroutine_threadsafe(_broadcast_order_update(broker_id, entry), _app_loop)
+def _resolve_dhan_account_for_broker_id(broker_id: str) -> tuple[str, str] | None:
+    """
+    broker_id here is a kite_market_config._id (see _simulator_place_manual_order_core:
+    Dhan orders are placed against broker_id == that doc's own _id, not a
+    broker_configuration._id like FlatTrade/Kite) — resolve it back to that account's
+    client_id/access_token so the WS route can open (or reuse) that SPECIFIC account's
+    order-update connection. Returns None for any broker_id that isn't a Dhan
+    kite_market_config doc (FlatTrade/Kite broker_ids fall through untouched).
+    """
+    try:
+        doc = _shared_mongo._db["kite_market_config"].find_one({"_id": ObjectId(broker_id), "broker": "dhan"})
+    except Exception:
+        return None
+    if not doc:
+        return None
+    client_id = str(doc.get("user_id") or doc.get("dhan_client_id") or "").strip()
+    access_token = str(doc.get("access_token") or "").strip()
+    if not client_id or not access_token:
+        return None
+    return client_id, access_token
 
 
 @app.on_event("startup")
-async def _auto_start_order_update_ws() -> None:
+async def _capture_app_loop() -> None:
     global _app_loop
     _app_loop = asyncio.get_event_loop()
 
@@ -127,17 +138,6 @@ async def _auto_start_order_update_ws() -> None:
     # CPU-bound work — a bigger pool costs idle-thread memory, not CPU.
     _app_loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=32))
 
-    async def _bg():
-        await asyncio.sleep(2)
-        try:
-            from features.dhan_order_update import dhan_order_update_manager
-            dhan_order_update_manager.add_update_listener(_on_dhan_order_alert)
-            dhan_order_update_manager.start(_shared_mongo._db)
-        except Exception:
-            log.exception("[STARTUP] Dhan order-update WS auto-start failed.")
-
-    asyncio.create_task(_bg())
-
 
 @order_router.websocket("/ws/order-updates")
 async def order_updates_socket(websocket: WebSocket, broker_id: str = Query(default="")) -> None:
@@ -146,12 +146,39 @@ async def order_updates_socket(websocket: WebSocket, broker_id: str = Query(defa
     Update WS (see features.dhan_order_update) relayed straight through, replacing their
     old poll-GET-/broker/orders-every-4s loop with a true push the moment Dhan emits a
     status change (COMPLETE/REJECTED/CANCELLED/TRIGGER_PENDING/OPEN).
+
+    Dhan connections are per-account (features.dhan_order_update's pool) and started here,
+    on demand, for the SPECIFIC account broker_id resolves to — not a single app-wide
+    connection — so this scales to one Dhan account per user instead of assuming there's
+    only ever one. A broker_id that isn't a Dhan kite_market_config doc (FlatTrade/Kite)
+    just registers the socket for whatever other channel pushes to it (e.g. a broker
+    postback) without touching Dhan at all.
     """
     await websocket.accept()
     if not broker_id:
         await websocket.close()
         return
     _register_order_update_socket(broker_id, websocket)
+
+    dhan_listener = None
+    dhan_conn = None
+    dhan_account = await asyncio.to_thread(_resolve_dhan_account_for_broker_id, broker_id)
+    if dhan_account:
+        from features.dhan_order_update import dhan_order_update_pool
+        client_id, access_token = dhan_account
+        dhan_conn = await asyncio.to_thread(dhan_order_update_pool.ensure_started, client_id, access_token)
+        if dhan_conn is not None:
+            loop = asyncio.get_event_loop()
+
+            def _forward(entry: dict) -> None:
+                # Runs on the Dhan WS's own thread — hop back onto this route's event loop
+                # to actually send. Scoped to this one broker_id/account pair, unlike the
+                # old app-wide broadcast.
+                asyncio.run_coroutine_threadsafe(_broadcast_order_update(broker_id, entry), loop)
+
+            dhan_listener = _forward
+            dhan_conn.add_update_listener(dhan_listener)
+
     try:
         while True:
             await websocket.receive_text()
@@ -160,6 +187,8 @@ async def order_updates_socket(websocket: WebSocket, broker_id: str = Query(defa
     except Exception:
         pass
     finally:
+        if dhan_conn is not None and dhan_listener is not None:
+            dhan_conn.remove_update_listener(dhan_listener)
         _unregister_order_update_socket(broker_id, websocket)
 
 
@@ -369,11 +398,19 @@ def _fetch_dhan_market_data(segment: str, sec_ids: list[int], db) -> dict[str, d
             ws_ltp = float(_dtm.ltp_map.get(sid_str) or 0)
             if ws_ltp > 0:
                 cached = _DHAN_MARKET_DATA_LAST_GOOD.get(f"{segment}:{sid_str}") or {}
+                ws_bid = float(_dtm.bid_map.get(sid_str) or 0)
+                ws_ask = float(_dtm.ask_map.get(sid_str) or 0)
+                ws_bid_qty = int(_dtm.bid_qty_map.get(sid_str) or 0)
+                ws_ask_qty = int(_dtm.ask_qty_map.get(sid_str) or 0)
                 result[sid_str] = {
                     "ltp": ws_ltp,
                     "oi": int(_dtm.oi_map.get(sid_str) or cached.get("oi", 0)),
-                    "bid": cached.get("bid", 0.0),
-                    "ask": cached.get("ask", 0.0),
+                    "bid": ws_bid or cached.get("bid", 0.0),
+                    "ask": ws_ask or cached.get("ask", 0.0),
+                    # Level-0 qty only — see algo.simulator/api.py's _fetch_dhan_market_data
+                    # for why the walk still falls back to REST depth when this isn't enough.
+                    "bid_depth": [{"price": ws_bid, "quantity": ws_bid_qty}] if ws_bid > 0 else cached.get("bid_depth", []),
+                    "ask_depth": [{"price": ws_ask, "quantity": ws_ask_qty}] if ws_ask > 0 else cached.get("ask_depth", []),
                     "prev_close": cached.get("prev_close", 0.0),
                 }
     except Exception:
@@ -406,6 +443,18 @@ def _fetch_dhan_market_data(segment: str, sec_ids: list[int], db) -> dict[str, d
                                 "oi":  int(info.get("oi") or 0),
                                 "bid": float((buy_levels[0] or {}).get("price") or 0) if buy_levels else 0.0,
                                 "ask": float((sell_levels[0] or {}).get("price") or 0) if sell_levels else 0.0,
+                                # Full depth (all levels Dhan returns, best→worst) — lets
+                                # _resolve_mpp_price walk past level 0 for an order qty bigger
+                                # than the top level alone holds instead of pricing as if it
+                                # were the whole book.
+                                "bid_depth": [
+                                    {"price": float(lvl.get("price") or 0), "quantity": int(lvl.get("quantity") or 0)}
+                                    for lvl in buy_levels if float(lvl.get("price") or 0) > 0
+                                ],
+                                "ask_depth": [
+                                    {"price": float(lvl.get("price") or 0), "quantity": int(lvl.get("quantity") or 0)}
+                                    for lvl in sell_levels if float(lvl.get("price") or 0) > 0
+                                ],
                                 "prev_close": float((info.get("ohlc") or {}).get("close") or 0),
                             }
                             result[str(sid)] = entry
@@ -459,6 +508,11 @@ async def _fetch_dhan_quote_for_leg(leg: "ManualOrderLeg", raw_db, quote_cache: 
         "ltp": float(quote.get("ltp") or 0),
         "bid": float(quote.get("bid") or 0),
         "ask": float(quote.get("ask") or 0),
+        # Full depth (best→worst) when available — see _fetch_dhan_market_data. WS-sourced
+        # quotes only ever have 1 level (Dhan's other 4 WS depth levels aren't parsed); REST
+        # quotes carry whatever Dhan's /marketfeed/quote returns (typically 5).
+        "bid_depth": quote.get("bid_depth") or ([{"price": float(quote.get("bid") or 0), "quantity": 0}] if quote.get("bid") else []),
+        "ask_depth": quote.get("ask_depth") or ([{"price": float(quote.get("ask") or 0), "quantity": 0}] if quote.get("ask") else []),
     }
 
 
@@ -500,14 +554,25 @@ def _notify_mpp_ltp_price_unresolved(kind: str, message: str) -> None:
 
 async def _resolve_mpp_price(leg: "ManualOrderLeg", raw_db, quote_cache: dict[str, dict] | None = None) -> float:
     """
-    MPP's price source: Dhan's live LTP (see _fetch_dhan_quote_for_leg), priced off Dhan's feed
-    regardless of the execution broker. Placed to the broker as a plain LIMIT order at this
-    price — no bid/ask protection-band markup.
+    MPP's walked-depth + protection% formula, priced off Dhan's feed regardless of the
+    execution broker (see _fetch_dhan_quote_for_leg) — same formula as
+    live_order_manager.py's place_live_entry_order/place_live_exit_order and
+    algo.simulator/api.py's & algo.trade/api.py's copies of this same function. Previously
+    this copy placed MPP orders at bare LTP with no bid/ask protection at all — a limit
+    order sitting between the spread doesn't cross and just rests, silently defeating the
+    whole point of "Market Price Protection."
+
+    Prices off the side this leg's qty actually has to sweep to fill — a BUY matches
+    against resting ASK orders, a SELL matches against resting BID orders — and walks that
+    side's depth levels (best→worst) until leg.quantity is covered, instead of assuming the
+    top level alone holds the whole order.
 
     Returns 0.0 — never leg.price as a stand-in — when Dhan has no contract match or no live
-    LTP yet. Every caller already treats a <= 0 return as "unresolved" and aborts the order
-    instead of placing it.
+    depth on the side this leg needs. Every caller already treats a <= 0 return as
+    "unresolved" and aborts the order instead of placing it.
     """
+    from features.live_order_manager import _mpp_protection_pct, _clamp_limit_price, _walk_depth_for_qty
+
     quote = await _fetch_dhan_quote_for_leg(leg, raw_db, quote_cache)
     if not quote:
         _notify_mpp_ltp_price_unresolved(
@@ -516,14 +581,32 @@ async def _resolve_mpp_price(leg: "ManualOrderLeg", raw_db, quote_cache: dict[st
         return 0.0
 
     ltp = quote["ltp"]
-    if ltp <= 0:
+    is_buy = leg.side == "BUY"
+    consume_side = quote["ask_depth"] if is_buy else quote["bid_depth"]
+    walked_price, fully_covered = _walk_depth_for_qty(consume_side, leg.quantity)
+    if walked_price <= 0:
         _notify_mpp_ltp_price_unresolved(
-            "MPP", f"No live LTP for {quote.get('symbol')} — order NOT placed.",
+            "MPP",
+            f"No live depth for {quote.get('symbol')} (side={'ask' if is_buy else 'bid'}, qty={leg.quantity}) — order NOT placed.",
         )
         return 0.0
+    if not fully_covered:
+        print(
+            f"[MPP PRICE][dhan-feed] symbol={quote['symbol']} qty={leg.quantity} not fully covered by visible "
+            f"{'ask' if is_buy else 'bid'}-side depth — pricing off deepest visible level {walked_price}, "
+            f"remainder may not fill immediately.",
+            flush=True,
+        )
 
-    print(f"[MPP PRICE][dhan-feed] symbol={quote['symbol']} ltp={ltp} price={ltp}", flush=True)
-    return ltp
+    pct = _mpp_protection_pct(ltp, is_option=leg.option_type.strip().upper() != "FUT")
+    raw_price = walked_price * (1 + pct / 100) if is_buy else walked_price * (1 - pct / 100)
+    price = _clamp_limit_price(raw_price, is_buy)
+    print(
+        f"[MPP PRICE][dhan-feed] symbol={quote['symbol']} ltp={ltp} qty={leg.quantity} "
+        f"walked_price={walked_price} fully_covered={fully_covered} pct={pct}% price={price} is_buy={is_buy}",
+        flush=True,
+    )
+    return price
 
 
 async def _resolve_ltp_price(leg: "ManualOrderLeg", raw_db, quote_cache: dict[str, dict] | None = None) -> float:
@@ -565,13 +648,32 @@ async def _simulator_place_manual_order_core(body: ManualOrderRequest) -> dict:
         # rate gate, adding roughly 1s per extra leg to a multi-leg order.
         quote_cache = await _batch_prefetch_dhan_quotes(body.orders, raw_db)
 
-        dhan_cfg = raw_db["kite_market_config"].find_one({"broker": "dhan"}) or {}
-        if broker_id and broker_id == str(dhan_cfg.get("_id") or "").strip():
+        # Looked up by _id (the specific account the user picked in the Order Pad), not just
+        # "any doc with broker=dhan" — kite_market_config can hold one Dhan doc per user (see
+        # broker_accounts.get_market_broker_accounts_for_user), so matching on broker alone
+        # would silently route every user's order through whichever Dhan doc Mongo happened
+        # to return first instead of the one this broker_id actually names.
+        dhan_cfg = {}
+        if broker_id:
+            try:
+                dhan_cfg = raw_db["kite_market_config"].find_one({"_id": ObjectId(broker_id), "broker": "dhan"}) or {}
+            except Exception:
+                dhan_cfg = {}
+        if dhan_cfg:
             dhan_client_id = str(dhan_cfg.get("user_id") or dhan_cfg.get("dhan_client_id") or "").strip()
             dhan_access_token = str(dhan_cfg.get("access_token") or "").strip()
             if not dhan_access_token or not dhan_client_id:
                 print("[PLACE_ORDER][dhan] credentials not configured", flush=True)
                 return {"status": "error", "message": "Dhan credentials not configured.", "results": []}
+
+            # Warm this account's order-update connection right away — don't wait for the
+            # browser to (re)open the /ws/order-updates socket first. Cheap no-op if it's
+            # already up (see dhan_order_update.py's pool docstring).
+            try:
+                from features.dhan_order_update import dhan_order_update_pool
+                dhan_order_update_pool.ensure_started(dhan_client_id, dhan_access_token)
+            except Exception:
+                log.warning("[PLACE_ORDER][dhan] order-update WS warm-start failed", exc_info=True)
 
             from features.dhan_broker import get_dhan_instance
             from features.order_execution import place_broker_order
